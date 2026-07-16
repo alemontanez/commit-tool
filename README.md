@@ -12,6 +12,9 @@ node commit-tool.js        # menú, modo REAL (opera sobre tu repo)
 node commit-tool.js --demo # menú, modo DEMO (simula todo, no toca git)
 ```
 
+> **¿Querés probar sin miedo?** Usá `--demo`: no ejecuta ni un solo comando de git,
+> simula todo con datos ficticios (rutas `src/demo/...` obviamente de ejemplo).
+
 ### Instalación global (correr `commit-tool` desde cualquier carpeta)
 
 Una vez, en la carpeta del script (ej: `C:\tools\commit-tool`):
@@ -53,20 +56,65 @@ function commit-tool { node C:\tools\commit-tool\commit-tool.js @args }
 
 ## El menú
 
-1. **Crear PR (flujo completo)** — branch → add -A → commit → pull --rebase de
-   development → rebase → push. Arma el commit con el formato
-   `{tipo}({EPIC}): [{TEAM}-{n}] {desc}` y la branch `{TEAM}-{n}`.
-2. **Chequear rama / sincronizar development** — te dice en qué rama estás, te
+1. **Crear PR (flujo completo, de un tiro)** — branch → add -A → commit →
+   pull --rebase de development → rebase → push, todo de corrido. Arma el commit
+   con el formato `{tipo}({EPIC}): [{TEAM}-{n}] {desc}` y la branch `{TEAM}-{n}`.
+   Es el "arma de un solo tiro": rápido y directo.
+2. **Modo pilotado (commits de a poco, subir/bajar manual)** — para trabajar más
+   controlado. Entrás/creás la rama una vez y después vos decidís cada paso desde
+   un tablero que muestra el estado real (rama, cambios sin commitear, commits sin
+   pushear):
+   - **Commitear** (repetible) — stagea (te pregunta *todo* o *elegir archivos*) y
+     commitea. Podés hacer varios commits antes de subir.
+   - **⬇️ Bajar** — sincroniza development (`pull --rebase`) y rebasa tu rama sobre
+     él. **Nunca pushea.** Avisa si tenés cambios sin commitear.
+   - **⬆️ Subir** — push. Antes chequea que tu rama esté sobre el último
+     development (y ofrece sincronizar si no); fuerza con `--force-with-lease` solo
+     si hizo falta reescribir.
+   - **🗑 Eliminar rama local** — borra una rama local (el remote no se toca).
+   - **📊 Estado detallado** — `git status` + commits de la rama sobre development.
+3. **Chequear rama / sincronizar development** — te dice en qué rama estás, te
    ofrece moverte a development y avisa si quedó atrás de origin (ofreciendo el
    pull --rebase).
-3. **Simular el flujo de PR (dry-run)** — igual que la 1 pero sin ejecutar nada
-   que modifique. Lee el repo real y muestra el plan.
 4. **Arreglar PR bugueado tras pasaje a producción** — actualiza development,
    rebasa la rama del PR, agrega un cambio mínimo (salto de línea a un archivo
    que elegís) para tener algo que commitear, y hace push **forzado**.
 5. **Administrar EPICs y TEAMs** — agregar / eliminar los guardados sin arrancar
    un commit.
 6. **Salir**.
+
+> El modo dry-run se sacó del menú: para probar sin tocar nada está `--demo`.
+
+## Tipos de commit (Conventional Commits)
+
+El commit se arma como `tipo(EPIC): [TEAM-n] descripción`. El `tipo` sigue la
+convención **[Conventional Commits](https://www.conventionalcommits.org/es/v1.0.0/)**,
+que a su vez toma los tipos de la [convención de Angular](https://github.com/angular/angular/blob/main/CONTRIBUTING.md#type).
+La idea: que el mensaje comunique *la intención* del cambio de forma estandarizada,
+lo que permite leer el historial de un vistazo y, si algún día se quiere, generar
+changelogs o versionado semántico automático.
+
+En la práctica, en el día a día del equipo se usan sobre todo **`feat`**, **`fix`**
+y **`refactor`**. Los demás quedan disponibles por si aparecen (docs, chore, test,
+perf, style, build, ci, revert), pero no son de uso frecuente.
+
+| tipo | cuándo |
+|------|--------|
+| `feat` | nueva funcionalidad |
+| `fix` | corrección de bug |
+| `refactor` | cambio de código sin cambiar comportamiento |
+| `docs` | documentación |
+| `chore` | tareas varias / mantenimiento |
+| `test` | tests |
+| `perf` | mejora de performance |
+| `style` | formato / estilo (sin cambio de lógica) |
+| `build` | sistema de build |
+| `ci` | integración continua |
+| `revert` | revertir un commit |
+
+Referencias:
+- Conventional Commits 1.0.0 — https://www.conventionalcommits.org/es/v1.0.0/
+- Angular commit message guidelines — https://github.com/angular/angular/blob/main/CONTRIBUTING.md#commit
 
 ## Force push
 
@@ -79,15 +127,15 @@ la opción 4), el push tiene que ser forzado. En esos casos:
 
 ## Otros comportamientos
 
-- **git add**: usa `git add -A` (todos los cambios del repo). Para el flujo de una
-  tarea a la vez.
+- **git add**: en la opción 1 (un tiro) usa `git add -A` (todos los cambios). En el
+  modo pilotado te **pregunta cada vez**: todo o elegir archivos por número (para
+  armar commits chicos y separados).
 - **Si la branch ya existe (local)** en la opción 1: te ofrece resetearla a
   development, borrarla y recrearla, usar otro número, o cancelar.
 - **Conflicto en el rebase**: frena, lista los archivos en conflicto y **no hace
   push**. Elegís entre abortar (`git rebase --abort`) o salir a resolver a mano.
 - **Config**: teams y EPICs en `~/.commit-tool.json` (fuera del repo). El último
-  team y EPIC usados aparecen primero.
-
-## Pendiente / a futuro
-
-- Soporte para más de un commit por branch.
+  team, EPIC y rama usados se recuerdan para no recargarlos.
+- **Link del PR**: al terminar un push, si el remote (Bitbucket / GitHub / GitLab)
+  devuelve el link para crear el PR/MR, se resalta al final (`→ Crear PR: ...`)
+  para que sea un clic y no quede perdido en el output del push.

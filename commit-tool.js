@@ -37,8 +37,17 @@ const COMMIT_TYPES = [
 ];
 
 let repoRoot = null;
-let DRY = false; // se activa en el dry-run
 let cfg = null;
+
+// Validadores / helpers reutilizables (antes duplicados en cada prompt)
+const upper = (x) => x.toUpperCase();
+const validateName = (x) => (!x ? 'No puede estar vacío' : (/\s/.test(x) ? 'Sin espacios' : null));
+const buildCommitMsg = ({ type = 'chore', epic, ticket, description }) => `${type}(${epic}): [${ticket}] ${description}`;
+
+// Datos ficticios del modo demo — nombres OBVIAMENTE de ejemplo para que nadie se asuste.
+const DEMO_STATUS = [' M src/demo/archivo-de-ejemplo.ts', '?? src/demo/notas-de-ejemplo.txt'];
+const DEMO_FILE = 'src/demo/archivo-de-ejemplo.ts';
+let demoDirty = true; // en demo simulamos que hay cambios sin commitear hasta que se "commitea"
 
 // ============================ COLORES ============================
 const paint = (n) => (s) => `\x1b[${n}m${s}\x1b[0m`;
@@ -50,10 +59,10 @@ function loadConfig() {
   for (const p of [CONFIG_PATH, OLD_CONFIG_PATH]) {
     try {
       const c = JSON.parse(fs.readFileSync(p, 'utf8'));
-      return { teams: c.teams || [], epics: c.epics || [], lastTeam: c.lastTeam || null, lastEpic: c.lastEpic || null };
+      return { teams: c.teams || [], epics: c.epics || [], lastTeam: c.lastTeam || null, lastEpic: c.lastEpic || null, lastBranch: c.lastBranch || null };
     } catch { /* sigue con el próximo path */ }
   }
-  return { teams: [], epics: [], lastTeam: null, lastEpic: null };
+  return { teams: [], epics: [], lastTeam: null, lastEpic: null, lastBranch: null };
 }
 function saveConfig() {
   try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), 'utf8'); }
@@ -135,11 +144,10 @@ function git(args, { cwd = repoRoot } = {}) {
   return { ok: r.status === 0, code: r.status, stdout: (r.stdout || '').trim(), stderr: (r.stderr || '').trim() };
 }
 
-async function step(args, { sim = {}, mutating = true } = {}) {
+async function step(args, { sim = {} } = {}) {
   console.log(gray('  $ ') + 'git ' + args.join(' '));
   await sleep(120);
   if (SANDBOX) { if (sim.note) console.log('    ' + green('✓ ') + dim(sim.note)); return { ok: true }; }
-  if (DRY && mutating) { console.log('    ' + yellow('◦ ') + dim('(dry-run: no ejecutado)')); return { ok: true, dry: true }; }
   const r = git(args);
   const out = [r.stdout, r.stderr].filter(Boolean).join('\n');
   if (out) console.log(out.split('\n').map((l) => dim('    ' + l)).join('\n'));
@@ -163,19 +171,17 @@ function cancel(msg = 'Cancelado.') { throw new Cancel(msg); }
 
 // ============================ PROMPTS REUTILIZABLES ============================
 async function pickTeam() {
-  const up = (x) => x.toUpperCase();
-  const v = (x) => (!x ? 'No puede estar vacío' : (/\s/.test(x) ? 'Sin espacios' : null));
   let team = null;
   if (cfg.lastTeam) { if (await confirm(`¿Usar el último team (${bold(cfg.lastTeam)})?`, true)) team = cfg.lastTeam; }
   if (!team) {
     if (cfg.teams.length === 0) {
       console.log(dim('  (todavía no hay teams guardados)'));
-      team = await text('Nombre del nuevo team (ej: NSTEAM1)', { validate: v, transform: up });
+      team = await text('Nombre del nuevo team (ej: NSTEAM1)', { validate: validateName, transform: upper });
     } else {
       const opts = cfg.teams.map((t) => ({ label: t, value: t }));
       opts.push({ label: green('➕ Cargar nuevo team'), value: '__new__' });
       const c = await select('Elegí el team:', opts);
-      team = c === '__new__' ? await text('Nombre del nuevo team', { validate: v, transform: up }) : c;
+      team = c === '__new__' ? await text('Nombre del nuevo team', { validate: validateName, transform: upper }) : c;
     }
   }
   if (!cfg.teams.includes(team)) cfg.teams.push(team);
@@ -184,19 +190,17 @@ async function pickTeam() {
 }
 
 async function pickEpic() {
-  const up = (x) => x.toUpperCase();
-  const v = (x) => (!x ? 'No puede estar vacío' : (/\s/.test(x) ? 'Sin espacios' : null));
   let epic;
   if (cfg.epics.length === 0) {
     console.log(dim('  (todavía no hay EPICs guardados)'));
-    epic = await text('Nombre del nuevo EPIC (ej: AR-RETEN-SANTAFE-REVFEB26)', { validate: v, transform: up });
+    epic = await text('Nombre del nuevo EPIC (ej: AR-RETEN-SANTAFE-REVFEB26)', { validate: validateName, transform: upper });
   } else {
     const opts = [];
     if (cfg.lastEpic) opts.push({ label: `${cfg.lastEpic} ${dim('(último usado)')}`, value: cfg.lastEpic });
     cfg.epics.filter((e) => e !== cfg.lastEpic).forEach((e) => opts.push({ label: e, value: e }));
     opts.push({ label: green('➕ Cargar nuevo EPIC'), value: '__new__' });
     const c = await select('Elegí el EPIC:', opts);
-    epic = c === '__new__' ? await text('Nombre del nuevo EPIC', { validate: v, transform: up }) : c;
+    epic = c === '__new__' ? await text('Nombre del nuevo EPIC', { validate: validateName, transform: upper }) : c;
   }
   if (!cfg.epics.includes(epic)) cfg.epics.push(epic);
   cfg.lastEpic = epic; saveConfig();
@@ -210,22 +214,28 @@ async function pickType() {
   return select('Tipo de commit:', COMMIT_TYPES.map((t) => ({ label: `${t.v.padEnd(9)} ${dim('· ' + t.d)}`, value: t.v })));
 }
 
-// ============================ TOOL 1 + 3: CREAR PR (real / dry) ============================
-async function flowCreatePR({ dryRun = false } = {}) {
-  DRY = dryRun;
-  const tag = dryRun ? cyan(' [DRY-RUN — no se modifica nada]') : '';
-  console.log(bold('› Crear PR' ) + tag);
+// Arma el mensaje convencional preguntando tipo/epic/descripción. El ticket viene dado (rama).
+async function buildCommitInteractive(ticket) {
+  const type = await pickType();
+  const epic = await pickEpic();
+  const description = await text('Descripción del commit', { validate: (x) => (x.length < 3 ? 'Muy corta' : null) });
+  return buildCommitMsg({ type, epic, ticket, description });
+}
+
+// ============================ TOOL 1: CREAR PR (flujo completo, de un tiro) ============================
+async function flowCreatePR() {
+  console.log(bold('› Crear PR'));
 
   // repo
   const info = getRepoInfo();
-  if (!SANDBOX && !info) { console.log(red('  ✗ No estás dentro de un repo git.')); DRY = false; return; }
+  if (!SANDBOX && !info) { console.log(red('  ✗ No estás dentro de un repo git.')); return; }
   console.log('  ' + green('✓ ') + dim('repo: ') + (SANDBOX ? info.root : repoRoot));
   if (!SANDBOX) {
     if (!info.hasRemote) console.log('  ' + yellow('⚠ ') + dim(`no encontré el remote '${REMOTE}'.`));
-    if (!branchExistsLocal(BASE_BRANCH)) { console.log(red(`  ✗ No existe la rama local '${BASE_BRANCH}'.`)); DRY = false; return; }
+    if (!branchExistsLocal(BASE_BRANCH)) { console.log(red(`  ✗ No existe la rama local '${BASE_BRANCH}'.`)); return; }
     if (info.branch !== BASE_BRANCH) {
-      if (!(await confirm(`Estás en '${info.branch}', no en '${BASE_BRANCH}'. ¿Cambio a '${BASE_BRANCH}'?`, true))) { DRY = false; return; }
-      if (!DRY) { const r = git(['checkout', BASE_BRANCH]); if (!r.ok) { console.log(red('  ✗ ' + r.stderr)); DRY = false; return; } }
+      if (!(await confirm(`Estás en '${info.branch}', no en '${BASE_BRANCH}'. ¿Cambio a '${BASE_BRANCH}'?`, true))) return;
+      const r = git(['checkout', BASE_BRANCH]); if (!r.ok) { console.log(red('  ✗ ' + r.stderr)); return; }
     }
     console.log('  ' + green('✓ ') + dim(`en '${BASE_BRANCH}'`));
   } else {
@@ -235,14 +245,14 @@ async function flowCreatePR({ dryRun = false } = {}) {
   // status
   console.log(bold('\n› Cambios sin commitear:'));
   if (SANDBOX) {
-    console.log('    ' + green(' M src/FileCabinet/SuiteScripts/ism/ism_abm/setRetencion.ts'));
+    DEMO_STATUS.forEach((l) => console.log('    ' + green(l)));
   } else {
     const st = git(['status', '--short']).stdout;
-    if (!st) { console.log(yellow('  No hay nada para commitear.')); DRY = false; return; }
+    if (!st) { console.log(yellow('  No hay nada para commitear.')); return; }
     console.log(st.split('\n').map((l) => '    ' + l).join('\n'));
   }
 
-  if (!SANDBOX && !dryRun) { if (!(await confirm('\n¿Los datos del repo están OK y seguimos?', true))) { DRY = false; return; } }
+  if (!SANDBOX) { if (!(await confirm('\n¿Los datos del repo están OK y seguimos?', true))) return; }
   console.log('');
 
   // prompts
@@ -264,13 +274,13 @@ async function flowCreatePR({ dryRun = false } = {}) {
       { label: 'Usar otro número (renombrar ahora)', value: 'rename' },
       { label: 'Cancelar', value: 'cancel' },
     ]);
-    if (c === 'cancel') { DRY = false; return; }
+    if (c === 'cancel') return;
     if (c === 'reset' || c === 'recreate') { strategy = c; break; }
     if (c === 'rename') { number = await askNumber('Nuevo número de tarea'); branch = `${team}-${number}`; }
   }
 
   const ticket = `${team}-${number}`;
-  const commitMsg = `${type}(${epic}): [${ticket}] ${description}`;
+  const commitMsg = buildCommitMsg({ type, epic, ticket, description });
   const forced = strategy !== 'create';
 
   // preview
@@ -284,43 +294,29 @@ async function flowCreatePR({ dryRun = false } = {}) {
   console.log('  Commit: ' + cyan(commitMsg));
   console.log('  Branch: ' + cyan(branch) + (forced ? dim('  [' + strategy + ']') : ''));
   console.log(dim('  ─────────────────────────────────────────────'));
-  [branchLine, `git add -A`, `git commit -m "..."`, `git checkout ${BASE_BRANCH}`, `git pull --rebase`,
+  [branchLine, `git add -A`, `git commit -m "${commitMsg}"`, `git checkout ${BASE_BRANCH}`, `git pull --rebase`,
     `git checkout ${branch}`, `git rebase ${BASE_BRANCH}`,
     forced ? `git push --force-with-lease ${REMOTE} ${branch}   ${yellow('(FORZADO)')}` : `git push ${REMOTE} ${branch}`,
   ].forEach((p) => console.log('    ' + gray('· ') + p));
   console.log('');
-  if (!(await confirm('¿Ejecuto todo esto?', true))) { DRY = false; return; }
+  if (!(await confirm('¿Ejecuto todo esto?', true))) return;
   console.log('\n' + bold('› Ejecutando...'));
 
   // branch step
   let r;
   if (strategy === 'create') r = await step(['checkout', '-b', branch], { sim: { note: `rama '${branch}' creada` } });
   else if (strategy === 'reset') r = await step(['checkout', '-B', branch], { sim: { note: `rama '${branch}' reseteada a ${BASE_BRANCH}` } });
-  else { r = await step(['branch', '-D', branch], { sim: { note: 'borrada' } }); if (real(r)) r = await step(['checkout', '-b', branch], { sim: { note: 'recreada' } }); }
+  else { r = await step(['branch', '-D', branch], { sim: { note: 'borrada' } }); if (isLive()) r = await step(['checkout', '-b', branch], { sim: { note: 'recreada' } }); }
   if (bad(r)) return stop('No pude preparar la rama.');
 
   r = await step(['add', '-A'], { sim: { note: 'staged' } }); if (bad(r)) return stop('Falló el add.');
-  r = await step(['commit', '-m', commitMsg], { sim: { note: 'commit creado' } }); if (bad(r)) return stop('Falló el commit.');
-  r = await step(['checkout', BASE_BRANCH], { sim: { note: `en '${BASE_BRANCH}'` } }); if (bad(r)) return stop('No pude volver a ' + BASE_BRANCH + '.');
-  r = await step(['pull', '--rebase'], { sim: { note: `${BASE_BRANCH} actualizado` } }); if (bad(r)) return stop('Falló el pull --rebase.');
-  r = await step(['checkout', branch], { sim: { note: `en '${branch}'` } }); if (bad(r)) return stop('No pude volver a la rama.');
+  if (!(await commit(commitMsg)).ok) return;
 
-  r = await step(['rebase', BASE_BRANCH], { sim: { note: 'rebase ok' } });
-  if (real(r) && !r.ok) { if (await handleRebaseConflict(branch)) return; else return; }
+  if (!(await syncFromBase(branch)).ok) return;            // bajar base + rebasar (maneja conflictos)
+  if (!(await pushBranch(branch, { forced })).ok) return;  // subir
 
-  // push (con confirmación de force)
-  if (forced && !SANDBOX && !DRY) {
-    console.log('\n  ' + yellow('⚠ Este caso reescribió la rama, el push tiene que ser FORZADO.'));
-    if (!(await confirm(`¿Hacer push --force-with-lease sobre ${branch}?`, false))) {
-      console.log(dim('  No pusheé. La rama local quedó lista; podés pushear a mano cuando quieras.'));
-      DRY = false; return;
-    }
-  }
-  const pushArgs = forced ? ['push', '--force-with-lease', REMOTE, branch] : ['push', REMOTE, branch];
-  r = await step(pushArgs, { sim: { note: 'pusheado — listo para el PR' } }); if (bad(r)) return stop('Falló el push.');
-
-  console.log('\n' + green(bold('✔ Listo.')) + dim(dryRun ? '  (dry-run: nada se modificó)' : ''));
-  DRY = false;
+  cfg.lastBranch = branch; saveConfig();
+  console.log('\n' + green(bold('✔ Listo.')));
 }
 
 // ============================ TOOL 2: CHEQUEAR / SINCRONIZAR ============================
@@ -378,7 +374,7 @@ async function toolFixProdPR() {
 
   // elegir archivo a tocar
   let fileToTouch = null;
-  if (SANDBOX) fileToTouch = 'src/FileCabinet/SuiteScripts/ism/ism_abm/setRetencion.ts';
+  if (SANDBOX) fileToTouch = DEMO_FILE;
   else {
     const files = git(['diff', '--name-only', `${BASE_BRANCH}...${branch}`]).stdout.split('\n').filter(Boolean);
     if (files.length) {
@@ -405,36 +401,24 @@ async function toolFixProdPR() {
   if (!(await confirm('¿Ejecuto esto?', true))) return;
   console.log('\n' + bold('› Ejecutando...'));
 
-  let r;
-  r = await step(['checkout', BASE_BRANCH], { sim: { note: `en '${BASE_BRANCH}'` } }); if (bad(r)) return stop('checkout falló.');
-  r = await step(['pull', '--rebase'], { sim: { note: `${BASE_BRANCH} actualizado` } }); if (bad(r)) return stop('pull falló.');
-  r = await step(['checkout', branch], { sim: { note: `en '${branch}'` } }); if (bad(r)) return stop('checkout falló.');
-  r = await step(['rebase', BASE_BRANCH], { sim: { note: 'rebase ok' } });
-  if (real(r) && !r.ok) { await handleRebaseConflict(branch); return; }
+  if (!(await syncFromBase(branch)).ok) return;   // bajar base + rebasar (maneja conflictos)
 
   // cambio mínimo
   if (SANDBOX) console.log('  ' + green('✓ ') + dim('(simulado) salto de línea agregado'));
-  else if (DRY) console.log('  ' + yellow('◦ ') + dim('(dry-run: no se tocó el archivo)'));
   else {
     try { fs.appendFileSync(path.join(repoRoot, fileToTouch), '\n'); console.log('  ' + green('✓ ') + dim('salto de línea agregado a ' + fileToTouch)); }
     catch (e) { return stop('No pude escribir el archivo: ' + e.message); }
   }
 
-  r = await step(['add', '-A'], { sim: { note: 'staged' } }); if (bad(r)) return stop('add falló.');
-  r = await step(['commit', '-m', commitMsg], { sim: { note: 'commit creado' } }); if (bad(r)) return stop('commit falló.');
+  let r = await step(['add', '-A'], { sim: { note: 'staged' } }); if (bad(r)) return stop('add falló.');
+  if (!(await commit(commitMsg)).ok) return;
 
-  console.log('\n  ' + yellow('⚠ Este flujo hace un push FORZADO sobre ' + branch + '.'));
-  if (!SANDBOX && !DRY && !(await confirm(`¿Hacer push --force-with-lease sobre ${branch}?`, false))) {
-    console.log(dim('  No pusheé. La rama quedó lista localmente.')); return;
-  }
-  r = await step(['push', '--force-with-lease', REMOTE, branch], { sim: { note: 'pusheado (forzado)' } }); if (bad(r)) return stop('push falló.');
+  if (!(await pushBranch(branch, { forced: true })).ok) return;   // subir (siempre forzado en este flujo)
   console.log('\n' + green(bold('✔ Listo.')));
 }
 
 // ============================ TOOL 5: ADMINISTRAR EPICs / TEAMs ============================
 async function toolManageConfig() {
-  const up = (x) => x.toUpperCase();
-  const v = (x) => (!x ? 'No puede estar vacío' : (/\s/.test(x) ? 'Sin espacios' : null));
   while (true) {
     console.log(bold('\n› Administrar EPICs y TEAMs'));
     console.log(dim('  TEAMs (' + cfg.teams.length + '): ') + (cfg.teams.join(', ') || dim('—')));
@@ -445,8 +429,8 @@ async function toolManageConfig() {
       { label: 'Volver al menú', value: 'back' },
     ]);
     if (c === 'back') return;
-    if (c === 'at') { const t = await text('Nuevo TEAM', { validate: v, transform: up }); if (cfg.teams.includes(t)) console.log(yellow('  Ya existía.')); else { cfg.teams.push(t); saveConfig(); console.log(green('  ✓ agregado.')); } }
-    if (c === 'ae') { const e = await text('Nuevo EPIC', { validate: v, transform: up }); if (cfg.epics.includes(e)) console.log(yellow('  Ya existía.')); else { cfg.epics.push(e); saveConfig(); console.log(green('  ✓ agregado.')); } }
+    if (c === 'at') { const t = await text('Nuevo TEAM', { validate: validateName, transform: upper }); if (cfg.teams.includes(t)) console.log(yellow('  Ya existía.')); else { cfg.teams.push(t); saveConfig(); console.log(green('  ✓ agregado.')); } }
+    if (c === 'ae') { const e = await text('Nuevo EPIC', { validate: validateName, transform: upper }); if (cfg.epics.includes(e)) console.log(yellow('  Ya existía.')); else { cfg.epics.push(e); saveConfig(); console.log(green('  ✓ agregado.')); } }
     if (c === 'dt') {
       if (!cfg.teams.length) { console.log(dim('  No hay teams.')); continue; }
       const t = await select('¿Cuál elimino?', [...cfg.teams.map((x) => ({ label: x, value: x })), { label: dim('(cancelar)'), value: '__c__' }]);
@@ -461,9 +445,95 @@ async function toolManageConfig() {
 }
 
 // ============================ HELPERS DE FLUJO ============================
-const real = (r) => SANDBOX || DRY ? false : true; // ¿estamos ejecutando de verdad?
-const bad = (r) => !SANDBOX && !DRY && r && !r.ok;
-function stop(msg) { console.log('\n' + red('✗ ' + msg) + dim('  (revisá con git status)')); DRY = false; }
+const isLive = () => !SANDBOX;                    // ¿estamos ejecutando git de verdad?
+const bad = (r) => !SANDBOX && r && !r.ok;
+function stop(msg) { console.log('\n' + red('✗ ' + msg) + dim('  (revisá con git status)')); }
+
+// ── PRIMITIVAS COMPARTIDAS (las usan tanto el flujo de un tiro como el pilotado) ──
+
+// Devuelve la ruta de archivo desde una línea de `git status --short`.
+function statusPath(line) {
+  let p = line.slice(3);                          // saltea los 2 chars de estado + espacio
+  const arrow = p.indexOf(' -> ');                // renames: "old -> new"
+  if (arrow !== -1) p = p.slice(arrow + 4);
+  return p.replace(/^"(.*)"$/, '$1');
+}
+
+// Cantidad de cambios sin commitear (en demo, según el estado simulado).
+const dirtyCount = () => SANDBOX ? (demoDirty ? DEMO_STATUS.length : 0) : git(['status', '--short']).stdout.split('\n').filter(Boolean).length;
+
+// Stagea cambios preguntando cada vez: todo o elegir archivos. Muestra el `git add`
+// tanto en real como en demo. { ok, empty }
+async function stageChanges() {
+  const files = SANDBOX ? (demoDirty ? DEMO_STATUS : []) : git(['status', '--short']).stdout.split('\n').filter(Boolean);
+  if (!files.length) { console.log(yellow('  No hay cambios para commitear.')); return { ok: false, empty: true }; }
+  const mode = await select('¿Qué stageo?', [
+    { label: 'Todo (git add -A)', value: 'all' },
+    { label: 'Elegir archivos', value: 'pick' },
+  ]);
+  let r;
+  if (mode === 'all') {
+    r = await step(['add', '-A'], { sim: { note: 'staged (todo)' } });
+  } else {
+    console.log(dim('  Archivos:'));
+    files.forEach((f, i) => console.log(`  ${dim((i + 1) + ')')} ${f}`));
+    const ans = await text("Números separados por coma (ej: 1,3) o 'todos'");
+    const paths = /^todos?$/i.test(ans.trim())
+      ? files.map(statusPath)
+      : [...new Set(ans.split(',').map((s) => parseInt(s.trim(), 10) - 1).filter((n) => n >= 0 && n < files.length))].map((i) => statusPath(files[i]));
+    if (!paths.length) { console.log(dim('  No elegiste nada.')); return { ok: false, empty: true }; }
+    r = await step(['add', '--', ...paths], { sim: { note: `staged (${paths.length})` } });
+  }
+  return bad(r) ? { ok: false } : { ok: true };
+}
+
+// Crea el commit con el mensaje ya armado. { ok }
+async function commit(commitMsg) {
+  const r = await step(['commit', '-m', commitMsg], { sim: { note: 'commit creado' } });
+  if (bad(r)) { stop('Falló el commit.'); return { ok: false }; }
+  return { ok: true };
+}
+
+// "Bajar": actualiza la base y rebasa la rama sobre ella. NUNCA pushea. { ok, conflict }
+async function syncFromBase(branch) {
+  let r = await step(['checkout', BASE_BRANCH], { sim: { note: `en '${BASE_BRANCH}'` } });
+  if (bad(r)) { stop('No pude ir a ' + BASE_BRANCH + '.'); return { ok: false }; }
+  r = await step(['pull', '--rebase'], { sim: { note: `${BASE_BRANCH} actualizado` } });
+  if (bad(r)) { stop('Falló el pull --rebase.'); return { ok: false }; }
+  r = await step(['checkout', branch], { sim: { note: `en '${branch}'` } });
+  if (bad(r)) { stop('No pude volver a la rama.'); return { ok: false }; }
+  r = await step(['rebase', BASE_BRANCH], { sim: { note: 'rebase ok' } });
+  if (isLive() && !r.ok) { await handleRebaseConflict(branch); return { ok: false, conflict: true }; }
+  return { ok: true };
+}
+
+// "Subir": push. Si la rama fue reescrita (rebase), pide force-with-lease con confirmación. { ok, skipped }
+async function pushBranch(branch, { forced = false } = {}) {
+  if (forced && isLive()) {
+    console.log('\n  ' + yellow('⚠ La rama fue reescrita; el push tiene que ser FORZADO.'));
+    if (!(await confirm(`¿Hacer push --force-with-lease sobre ${branch}?`, false))) {
+      console.log(dim('  No pusheé. La rama local quedó lista; podés pushear a mano cuando quieras.'));
+      return { ok: false, skipped: true };
+    }
+  }
+  const args = forced ? ['push', '--force-with-lease', REMOTE, branch] : ['push', REMOTE, branch];
+  const r = await step(args, { sim: { note: forced ? 'pusheado (forzado)' : 'pusheado — listo para el PR' } });
+  if (bad(r)) { stop('Falló el push.'); return { ok: false }; }
+  showPrLink(branch, r);
+  return { ok: true };
+}
+
+// Resalta el link para crear el PR/MR que el remote (Bitbucket, GitHub, GitLab...)
+// devuelve en el stderr del push, así queda a un clic en vez de perdido en el output.
+function showPrLink(branch, r) {
+  if (SANDBOX) {
+    console.log('\n  ' + bold(green('→ Crear PR: ')) + cyan(`https://bitbucket.org/tu-workspace/tu-repo/pull-requests/new?source=${branch}`) + dim('  (demo)'));
+    return;
+  }
+  const urls = ((r && r.stderr) || '').match(/https?:\/\/\S+/g) || [];
+  const prUrl = urls.find((u) => /pull-?request|merge_request|pull\/new/i.test(u));
+  if (prUrl) console.log('\n  ' + bold(green('→ Crear PR: ')) + cyan(prUrl));
+}
 
 async function handleRebaseConflict(branch) {
   const conflicted = git(['diff', '--name-only', '--diff-filter=U']).stdout;
@@ -481,8 +551,154 @@ async function handleRebaseConflict(branch) {
     console.log(dim('    1) resolvé los conflictos  2) git add <archivos> && git rebase --continue  3) git push ' + REMOTE + ' ' + branch));
   }
   console.log(yellow('  Frené antes del push.'));
-  DRY = false;
-  return true;
+}
+
+// ============================ MODO PILOTADO ============================
+// Caja automática pero manual al subir/bajar: entrás a una rama, commiteás de a
+// poco, y vos decidís cuándo bajar (sync) y cuándo subir (push). El estado vive
+// en git, así que cada vuelta releemos la rama real.
+async function pilotedMode() {
+  console.log(bold('› Modo pilotado'));
+  const info = getRepoInfo();
+  if (!SANDBOX && !info) { console.log(red('  ✗ No estás en un repo git.')); return; }
+
+  while (true) {
+    const branch = SANDBOX ? (cfg.lastBranch || 'DEMO-000') : git(['rev-parse', '--abbrev-ref', 'HEAD']).stdout;
+    const onBase = branch === BASE_BRANCH;
+
+    // tablero
+    console.log('');
+    console.log(dim('  ──────── estado ────────'));
+    console.log('  Rama: ' + cyan(branch) + (onBase ? yellow('  (estás en la base — entrá a una rama de tarea)') : ''));
+    const dirty = dirtyCount();
+    console.log('  Cambios sin commitear: ' + (dirty ? yellow(String(dirty)) : dim('0')));
+    if (!SANDBOX && !onBase) {
+      const remoteRef = git(['rev-parse', '--verify', '--quiet', `refs/remotes/${REMOTE}/${branch}`]).ok;
+      const ahead = remoteRef ? parseInt(git(['rev-list', '--count', `${REMOTE}/${branch}..${branch}`]).stdout || '0', 10)
+                              : parseInt(git(['rev-list', '--count', `${BASE_BRANCH}..${branch}`]).stdout || '0', 10);
+      console.log('  Commits sin pushear: ' + (ahead ? yellow(String(ahead)) : dim('0')) + (remoteRef ? '' : dim('  (rama nueva, sin remote)')));
+    }
+    console.log(dim('  ─────────────────────────'));
+
+    const c = await select('Acción:', [
+      { label: '⬢  Entrar / crear rama de tarea', value: 'branch' },
+      { label: '💾 Commitear (stagea + commit; repetible)', value: 'commit' },
+      { label: '⬇️  Bajar cambios — sync ' + BASE_BRANCH + ' (sin push)', value: 'down' },
+      { label: '⬆️  Subir — push', value: 'up' },
+      { label: '🗑  Eliminar rama local', value: 'delete' },
+      { label: '📊 Estado detallado', value: 'status' },
+      { label: '↩️  Volver al menú', value: 'back' },
+    ]);
+    if (c === 'back') return;
+    try {
+      if (c === 'branch') await pilotEnterBranch();
+      else if (c === 'commit') await pilotCommit(branch, onBase);
+      else if (c === 'down') await pilotDown(branch, onBase);
+      else if (c === 'up') await pilotUp(branch, onBase);
+      else if (c === 'delete') await pilotDeleteBranch(branch);
+      else if (c === 'status') pilotStatus(branch);
+    } catch (e) {
+      if (!(e instanceof Cancel)) console.log(red('  ✗ ' + e.message));
+    }
+  }
+}
+
+async function pilotEnterBranch() {
+  const team = await pickTeam();
+  const number = await askNumber();
+  const branch = `${team}-${number}`;
+  if (SANDBOX) { cfg.lastBranch = branch; saveConfig(); console.log('  ' + green('✓ ') + dim(`(demo) en '${branch}'`)); return; }
+  if (branchExistsLocal(branch)) {
+    const r = await step(['checkout', branch], { sim: {} });
+    if (bad(r)) return stop('No pude entrar a la rama.');
+    console.log('  ' + green('✓ ') + dim(`entraste a '${branch}'`));
+  } else {
+    if (!branchExistsLocal(BASE_BRANCH)) { console.log(red(`  ✗ No existe la base '${BASE_BRANCH}'.`)); return; }
+    const r = await step(['checkout', '-b', branch, BASE_BRANCH], { sim: {} });
+    if (bad(r)) return stop('No pude crear la rama (¿cambios sin commitear que chocan?).');
+    console.log('  ' + green('✓ ') + dim(`rama '${branch}' creada desde ${BASE_BRANCH}`));
+  }
+  cfg.lastBranch = branch; saveConfig();
+}
+
+async function pilotCommit(branch, onBase) {
+  if (onBase && !(await confirm(yellow(`Estás en '${BASE_BRANCH}'. ¿Seguro querés commitear acá?`), false))) return;
+  const staged = await stageChanges();   // muestra el git add (real y demo)
+  if (!staged.ok) return;
+  const commitMsg = await buildCommitInteractive(branch);
+  console.log('\n  Commit: ' + cyan(commitMsg));
+  if (!(await confirm('¿Commiteo?', true))) return;
+  if ((await commit(commitMsg)).ok) { if (SANDBOX) demoDirty = false; console.log('  ' + green('✓ ') + dim('commit creado (todavía sin pushear)')); }
+}
+
+async function pilotDown(branch, onBase) {
+  if (dirtyCount() > 0) {
+    console.log('  ' + yellow('⚠ Tenés cambios sin commitear.') + dim(' Commiteá primero: el rebase no corre con el árbol sucio y podrías perder trabajo.'));
+    return;
+  }
+  if (onBase) {
+    const r = await step(['pull', '--rebase'], { sim: { note: `${BASE_BRANCH} actualizado` } });
+    if (bad(r)) return stop('Falló el pull --rebase.');
+    console.log('  ' + green('✓ ') + dim(`'${BASE_BRANCH}' al día.`));
+    return;
+  }
+  if ((await syncFromBase(branch)).ok) console.log('  ' + green('✓ ') + dim(`rama al día con ${BASE_BRANCH} (sin push).`));
+}
+
+async function pilotUp(branch, onBase) {
+  if (onBase) { console.log(yellow(`  '${BASE_BRANCH}' no se pushea desde acá.`)); return; }
+  // Antes de pushear: asegurar que la rama esté sobre el último development del remote.
+  if (!SANDBOX) {
+    git(['fetch', REMOTE, BASE_BRANCH]);
+    const behind = parseInt(git(['rev-list', '--count', `${branch}..${REMOTE}/${BASE_BRANCH}`]).stdout || '0', 10);
+    if (behind > 0) {
+      console.log('  ' + yellow(`⚠ '${branch}' no está sobre el último '${BASE_BRANCH}' (faltan ${behind} commit(s) del remote).`));
+      if (await confirm(`¿Sincronizo ${BASE_BRANCH} y rebaso ${branch} antes del push?`, true)) {
+        if (dirtyCount() > 0) { console.log('  ' + yellow('⚠ Hay cambios sin commitear; commiteá antes de sincronizar.')); return; }
+        if (!(await syncFromBase(branch)).ok) return;   // si hubo conflicto, ya frenó
+      }
+    }
+  }
+  // Si el remote de la rama tiene commits que no están en local, es porque rebaseamos → push forzado.
+  let forced = false;
+  if (!SANDBOX) {
+    const remoteRef = git(['rev-parse', '--verify', '--quiet', `refs/remotes/${REMOTE}/${branch}`]).ok;
+    if (remoteRef) forced = parseInt(git(['rev-list', '--count', `${branch}..${REMOTE}/${branch}`]).stdout || '0', 10) > 0;
+  }
+  if ((await pushBranch(branch, { forced })).ok) console.log('  ' + green('✓ ') + dim('pusheado.'));
+}
+
+async function pilotDeleteBranch(current) {
+  const team = await pickTeam();
+  const number = await askNumber();
+  const target = `${team}-${number}`;
+  if (SANDBOX) {
+    if (!(await confirm(`¿Eliminar la rama LOCAL '${target}'?`, false))) return;
+    console.log('  ' + green('✓ ') + dim(`(demo) rama local '${target}' eliminada — el remote no se toca`));
+    if (cfg.lastBranch === target) { cfg.lastBranch = null; saveConfig(); }
+    return;
+  }
+  if (!branchExistsLocal(target)) { console.log(yellow(`  La rama '${target}' no existe localmente.`)); return; }
+  console.log('  ' + yellow(`⚠ Vas a borrar la rama LOCAL '${target}'.`) + dim(' (el remote no se toca)'));
+  if (!(await confirm(`¿Eliminar '${target}'?`, false))) return;
+  if (current === target) {   // no se puede borrar la rama en la que estás parado
+    const c = await step(['checkout', BASE_BRANCH], { sim: {} });
+    if (bad(c)) return stop(`No pude salir de '${target}' hacia '${BASE_BRANCH}'.`);
+  }
+  const r = await step(['branch', '-D', target], { sim: { note: 'borrada' } });
+  if (bad(r)) return stop('No pude borrar la rama (¿tiene cambios sin mergear? probá -D de nuevo).');
+  if (cfg.lastBranch === target) { cfg.lastBranch = null; saveConfig(); }
+  console.log('  ' + green('✓ ') + dim(`rama local '${target}' eliminada.`));
+}
+
+function pilotStatus(branch) {
+  if (SANDBOX) { console.log(dim('  (demo) git status / log simulados.')); return; }
+  console.log(dim('  git status --short:'));
+  const st = git(['status', '--short']).stdout;
+  console.log(st ? st.split('\n').map((l) => '    ' + l).join('\n') : dim('    (limpio)'));
+  console.log(dim(`  Commits de la rama sobre ${BASE_BRANCH}:`));
+  const log = git(['log', '--oneline', '-8', `${BASE_BRANCH}..${branch}`]).stdout;
+  console.log(log ? log.split('\n').map((l) => '    ' + l).join('\n') : dim(`    (sin commits sobre ${BASE_BRANCH})`));
 }
 
 // ============================ MENÚ ============================
@@ -500,26 +716,25 @@ async function mainMenu() {
   while (true) {
     console.log('');
     const choice = await select('¿Qué querés hacer?', [
-      { label: '1. Crear PR (flujo completo)', value: 'create' },
-      { label: '2. Chequear rama / sincronizar ' + BASE_BRANCH, value: 'check' },
-      { label: '3. Simular el flujo de PR (dry-run, no toca nada)', value: 'dry' },
+      { label: '1. Crear PR (flujo completo, un solo commit)', value: 'create' },
+      { label: '2. Modo pilotado (commits de a poco, subir/bajar manual)', value: 'piloted' },
+      { label: '3. Chequear rama / sincronizar ' + BASE_BRANCH, value: 'check' },
       { label: '4. Arreglar PR bugueado tras pasaje a producción', value: 'fixprod' },
       { label: '5. Administrar EPICs y TEAMs', value: 'config' },
       { label: '6. Salir', value: 'exit' },
     ]);
-    if (choice === 'exit') { console.log(dim('Chau!')); return; }
+    if (choice === 'exit') { return; }
     try {
-      if (choice === 'create') await flowCreatePR({ dryRun: false });
+      if (choice === 'create') await flowCreatePR();
+      else if (choice === 'piloted') await pilotedMode();
       else if (choice === 'check') await toolCheckSync();
-      else if (choice === 'dry') await flowCreatePR({ dryRun: true });
       else if (choice === 'fixprod') await toolFixProdPR();
       else if (choice === 'config') await toolManageConfig();
     } catch (e) {
       if (!(e instanceof Cancel)) console.log(red('\n✗ ' + e.message));
-      DRY = false;
     }
     console.log('');
-    if (!(await confirm('¿Volver al menú?', true))) { console.log(dim('Chau!')); return; }
+    if (!(await confirm('¿Volver al menú?', true))) { return; }
   }
 }
 
