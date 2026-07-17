@@ -535,22 +535,107 @@ function showPrLink(branch, r) {
   if (prUrl) console.log('\n  ' + bold(green('→ Crear PR: ')) + cyan(prUrl));
 }
 
+// Elige un nombre de backup libre: RAMA-bk, RAMA-bk2, RAMA-bk3, ...
+function pickBackupName(branch) {
+  let name = `${branch}-bk`;
+  let i = 2;
+  while (branchExistsLocal(name)) { name = `${branch}-bk${i++}`; }
+  return name;
+}
+
+// OPCIÓN AGRESIVA de resolución: en vez de mergear el conflicto, rehace la rama
+// desde development actualizado y trae TUS versiones de los archivos elegidos.
+// Descarta lo que otros cambiaron EN ESOS archivos (queda como revisión de código;
+// sus cambios siguen sanos en development). Nada se borra hasta que el push salió bien.
+async function rebuildBranchFromBackup(branch) {
+  console.log('\n  ' + yellow('⚠ Rehacer la rama (modo agresivo).'));
+  console.log(dim(`  Trae TUS versiones de los archivos que elijas y descarta lo que otros cambiaron en ESOS archivos.`));
+  console.log(dim(`  (los cambios ajenos siguen intactos en '${BASE_BRANCH}'; esto es un tema de revisión de código, no de pérdida de datos). Al final PUSHEA.`));
+
+  // salgo del conflicto; la rama vuelve como estaba (tu commit intacto)
+  const ab = git(['rebase', '--abort']);
+  if (!ab.ok) { console.log(red('  ✗ No pude abortar el rebase: ' + ab.stderr)); return; }
+
+  const commitMsg = git(['log', '-1', '--format=%B', branch]).stdout;           // mensaje del último commit
+  const changed = git(['diff', '--name-only', `${BASE_BRANCH}...${branch}`]).stdout.split('\n').filter(Boolean);
+  if (!changed.length) { console.log(yellow('  No detecté archivos cambiados en la rama; mejor resolvé a mano.')); return; }
+
+  // elegir qué archivos traer
+  console.log(dim('\n  Archivos que tocaste en la rama:'));
+  changed.forEach((f, i) => console.log(`  ${dim((i + 1) + ')')} ${f}`));
+  const mode = await select('¿Qué archivos traigo (con TU versión)?', [
+    { label: 'Traer TODOS', value: 'all' },
+    { label: 'Elegir cuáles', value: 'pick' },
+  ]);
+  let files = changed;
+  if (mode === 'pick') {
+    const ans = await text("Números separados por coma (ej: 1,3) o 'todos'");
+    files = /^todos?$/i.test(ans.trim()) ? changed
+      : [...new Set(ans.split(',').map((s) => parseInt(s.trim(), 10) - 1).filter((n) => n >= 0 && n < changed.length))].map((i) => changed[i]);
+    if (!files.length) { console.log(dim('  No elegiste nada. Cancelo (la rama sigue como estaba, rebase abortado).')); return; }
+  }
+
+  // preview + confirmación
+  const bk = pickBackupName(branch);
+  console.log('\n  ' + bold('Voy a hacer:'));
+  [`git branch -m ${branch} ${bk}`, `git checkout -b ${branch} ${BASE_BRANCH}`, `git checkout ${bk} -- ${files.join(' ')}`,
+    `git add -A`, `git commit -m "${commitMsg}"`, `git push ${REMOTE} ${branch}`,
+  ].forEach((p) => console.log('    ' + gray('· ') + p));
+  if (!(await confirm('¿Ejecuto?', true))) { console.log(dim('  Cancelado. La rama sigue como estaba (rebase abortado).')); return; }
+
+  // b) backup por rename
+  let r = await step(['branch', '-m', branch, bk], { sim: { note: `backup '${bk}' creado` } }); if (bad(r)) return stop('No pude renombrar la rama a backup.');
+  // c) rama nueva desde development (ya actualizado por el pull --rebase previo)
+  r = await step(['checkout', '-b', branch, BASE_BRANCH], { sim: { note: `'${branch}' recreada desde ${BASE_BRANCH}` } }); if (bad(r)) return stop('No pude recrear la rama.');
+  // d) traer TUS versiones de los archivos elegidos, desde el backup
+  r = await step(['checkout', bk, '--', ...files], { sim: { note: `${files.length} archivo(s) traído(s) del backup` } }); if (bad(r)) return stop('No pude traer los archivos del backup.');
+  // e) commit único con el mensaje del último commit
+  r = await step(['add', '-A'], { sim: { note: 'staged' } }); if (bad(r)) return stop('add falló.');
+  if (!(await commit(commitMsg)).ok) return;
+  console.log('  ' + green('✓ ') + dim(`rama '${branch}' rehecha sobre ${BASE_BRANCH}, sin conflicto.`));
+
+  // f) push (detección de force por si la rama ya existía en el remote)
+  cfg.lastBranch = branch; saveConfig();
+  let forced = false;
+  const remoteRef = git(['rev-parse', '--verify', '--quiet', `refs/remotes/${REMOTE}/${branch}`]).ok;
+  if (remoteRef) forced = parseInt(git(['rev-list', '--count', `${branch}..${REMOTE}/${branch}`]).stdout || '0', 10) > 0;
+  const pushed = await pushBranch(branch, { forced });
+
+  // g) limpiar backup solo si el push salió bien (y si el usuario quiere)
+  if (pushed.ok) {
+    console.log('\n' + green(bold('✔ Listo — rama rehecha y pusheada.')));
+    if (await confirm(`¿Borro el backup '${bk}' ahora? (si querés verificar el PR primero, dejalo)`, false)) {
+      const d = git(['branch', '-D', bk]);
+      console.log(d.ok ? green('  ✓ backup borrado.') : red('  ✗ ' + d.stderr));
+    } else {
+      console.log(dim(`  El backup '${bk}' queda como red de seguridad. Cuando confirmes que está todo bien: git branch -D ${bk}`));
+    }
+  } else {
+    console.log(dim(`  No se pusheó. Tu trabajo está a salvo en '${bk}' (backup) y en '${branch}'.`));
+  }
+}
+
 async function handleRebaseConflict(branch) {
   const conflicted = git(['diff', '--name-only', '--diff-filter=U']).stdout;
   console.log('\n  ' + yellow('⚠ El rebase encontró conflictos.'));
   if (conflicted) { console.log(dim('  Archivos en conflicto:')); conflicted.split('\n').forEach((f) => console.log('    ' + red('· ') + f)); }
-  const c = await select('¿Cómo seguimos? (NO se va a hacer push)', [
+  console.log(dim('  Tranqui: tus commits NO se pierden. Si abortás, la rama vuelve exactamente como estaba.'));
+  const c = await select('¿Cómo seguimos? (NO se va a hacer push, salvo la opción de rehacer)', [
     { label: 'Abortar el rebase y volver todo atrás (git rebase --abort)', value: 'abort' },
     { label: 'Salir y resolver a mano en la terminal', value: 'manual' },
+    { label: yellow('Rehacer la rama desde ' + BASE_BRANCH + ' con mis archivos (agresivo, con backup)'), value: 'rebuild' },
   ]);
   if (c === 'abort') {
     const a = git(['rebase', '--abort']);
     console.log(a.ok ? green('  ✓ Rebase abortado.') : red('  ✗ ' + a.stderr));
+    console.log(yellow('  Frené antes del push.'));
+  } else if (c === 'rebuild') {
+    await rebuildBranchFromBackup(branch);
   } else {
     console.log(dim('  Rebase en curso. Para continuar:'));
     console.log(dim('    1) resolvé los conflictos  2) git add <archivos> && git rebase --continue  3) git push ' + REMOTE + ' ' + branch));
+    console.log(yellow('  Frené antes del push.'));
   }
-  console.log(yellow('  Frené antes del push.'));
 }
 
 // ============================ MODO PILOTADO ============================
@@ -614,6 +699,21 @@ async function pilotEnterBranch() {
     console.log('  ' + green('✓ ') + dim(`entraste a '${branch}'`));
   } else {
     if (!branchExistsLocal(BASE_BRANCH)) { console.log(red(`  ✗ No existe la base '${BASE_BRANCH}'.`)); return; }
+    // Prevención: branchear desde un development viejo genera conflictos de rebase después.
+    // Traemos lo último y, si development está limpio, lo actualizamos antes de crear la rama.
+    git(['fetch', REMOTE, BASE_BRANCH]);
+    const behind = parseInt(git(['rev-list', '--count', `${BASE_BRANCH}..${REMOTE}/${BASE_BRANCH}`]).stdout || '0', 10);
+    if (behind > 0) {
+      console.log('  ' + yellow(`⚠ Tu '${BASE_BRANCH}' local está ${behind} commit(s) atrás de ${REMOTE}.`) + dim(' Branchear desde acá suele traer conflictos de rebase después.'));
+      if (dirtyCount() > 0) {
+        console.log('  ' + dim(`Tenés cambios sin commitear, así que no puedo actualizar '${BASE_BRANCH}' ahora. Creo la rama desde tu '${BASE_BRANCH}' local igual (ojo con el rebase después).`));
+      } else if (await confirm(`¿Actualizo '${BASE_BRANCH}' antes de crear la rama? (evita el problema del rebase)`, true)) {
+        const cur = git(['rev-parse', '--abbrev-ref', 'HEAD']).stdout;
+        if (cur !== BASE_BRANCH) { const co = git(['checkout', BASE_BRANCH]); if (!co.ok) { console.log(red('  ✗ ' + co.stderr)); return; } }
+        const pr = await step(['pull', '--rebase'], { sim: { note: `${BASE_BRANCH} actualizado` } });
+        if (bad(pr)) return stop(`No pude actualizar '${BASE_BRANCH}'.`);
+      }
+    }
     const r = await step(['checkout', '-b', branch, BASE_BRANCH], { sim: {} });
     if (bad(r)) return stop('No pude crear la rama (¿cambios sin commitear que chocan?).');
     console.log('  ' + green('✓ ') + dim(`rama '${branch}' creada desde ${BASE_BRANCH}`));
