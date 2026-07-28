@@ -185,13 +185,13 @@ cada paso desde un **tablero** que relee el estado real de git en cada vuelta.
   Commits sin pushear: 1
   ─────────────────────────
 Acción:
-  ⬢  Entrar / crear rama de tarea
-  💾 Commitear (stagea + commit; repetible)
-  ⬇️  Bajar cambios — sync development (sin push)
-  ⬆️  Subir — push
-  🗑  Eliminar rama local
-  📊 Estado detallado
-  ↩️  Volver al menú
+  · Entrar / crear rama de tarea
+  · Commitear (stagea + commit; repetible)
+  · Bajar cambios — sync development (sin push)
+  · Subir — push
+  · Eliminar rama local
+  · Estado detallado
+  · Volver al menú
 ```
 
 El tablero se calcula con:
@@ -200,7 +200,7 @@ El tablero se calcula con:
 - Commits sin pushear → `git rev-list --count origin/RAMA..RAMA` (o `development..RAMA`
   si la rama todavía no tiene remote)
 
-### ⬢ Entrar / crear rama de tarea
+### Entrar / crear rama de tarea
 
 Te pide TEAM y número y arma `TEAM-número`. Después:
 
@@ -217,7 +217,7 @@ Te pide TEAM y número y arma `TEAM-número`. Después:
   - Si tenés **cambios sin commitear** (no se puede actualizar limpio), no rompe: te
     avisa y crea igual desde tu development local.
 
-### 💾 Commitear (repetible)
+### Commitear (repetible)
 
 Podés hacer **varios commits** antes de subir. Cada vez:
 
@@ -229,7 +229,7 @@ Podés hacer **varios commits** antes de subir. Cada vez:
    la rama actual).
 3. `git commit -m "tipo(EPIC): [TEAM-número] descripción"`
 
-### ⬇️ Bajar cambios — sync development (sin push)
+### Bajar cambios — sync development (sin push)
 
 Trae lo último de `development` y rebasa tu rama encima. **Nunca pushea.**
 
@@ -247,7 +247,7 @@ git rebase development
 - Si estás parado en `development`, solo hace `git pull --rebase`.
 - Si el rebase choca → maneja el conflicto (ver *Casos peligrosos y errores*).
 
-### ⬆️ Subir — push
+### Subir — push
 
 Pushea tu rama, pero **antes se asegura de que esté sobre el último development** y
 decide solo si el push tiene que ser forzado.
@@ -263,7 +263,7 @@ decide solo si el push tiene que ser forzado.
    - Forzado → `git push --force-with-lease origin TEAM-número` (con confirmación)
 5. Muestra el link de crear PR si el remote lo devuelve.
 
-### 🗑 Eliminar rama local
+### Eliminar rama local
 
 Borra una rama **local** (el remote **no se toca**). Útil cuando querés limpiar o
 rehacer una rama.
@@ -273,7 +273,7 @@ rehacer una rama.
 3. Si estás parado en esa rama, primero sale: `git checkout development`.
 4. `git branch -D TEAM-número`
 
-### 📊 Estado detallado
+### Estado detallado
 
 Solo lectura, no modifica nada:
 
@@ -340,22 +340,15 @@ Lo resuelve la **Opción 4** (siguiente sección).
 ## Opción 4 — Arreglar PR bugueado tras pasaje a producción
 
 **El caso**: un PR ya pasó a producción y algo quedó mal; hay que **refrescar la
-rama del PR** (rebasada sobre el último development) y volver a pushear para
-re-disparar el proceso. Como no siempre hay un cambio de código que hacer, la
-herramienta agrega un **cambio mínimo** (un salto de línea a un archivo) para tener
-algo que commitear, y hace **push forzado**.
+rama del PR** rebasándola sobre el último development y volver a pushear (forzado)
+para re-disparar el proceso.
 
 ### Paso a paso
 
 1. Te pide TEAM y número → arma `TEAM-número`.
 2. Si la rama **no está local**, la trae del remote:
    `git fetch origin TEAM-número` + `git checkout -b TEAM-número origin/TEAM-número`.
-3. Te pide EPIC y una descripción (default: `refresh PR tras pasaje a produccion`).
-   El commit será: `chore(EPIC): [TEAM-número] descripción`.
-4. Elegís a qué archivo hacerle el cambio mínimo. Para ayudarte, lista los archivos
-   que tocó la rama: `git diff --name-only development...TEAM-número` (o escribís una
-   ruta a mano).
-5. Muestra el resumen y pide confirmación.
+3. Muestra el resumen y pide confirmación.
 
 ### Comandos que ejecuta
 
@@ -364,10 +357,7 @@ git checkout development
 git pull --rebase
 git checkout TEAM-número
 git rebase development                    # refresca la rama sobre lo último
-# (agrega un salto de línea al archivo elegido)
-git add -A
-git commit -m "chore(EPIC): [TEAM-número] descripción"
-git push --force-with-lease origin TEAM-número   # SIEMPRE forzado
+git push -f origin TEAM-número            # push FORZADO
 ```
 
 Este flujo **siempre** termina en push forzado (con confirmación), porque reescribe
@@ -407,9 +397,15 @@ rebase choca con un montón de conflictos". En vez de mergear a mano, **rehace l
 desde el development actualizado y trae tus versiones** de los archivos que elijas.
 No borra nada hasta que el push salió bien.
 
+La lista de archivos a traer son los **exactos que commiteaste en esta sesión**
+(la herramienta los registra en cada commit, con `git diff-tree --name-only HEAD`),
+no un diff que podría arrastrar archivos de más. Si no hubo commit de la sesión
+(ej. arreglar PR), cae a los archivos de los commits propios de la rama
+(`git log --name-only development..RAMA`).
+
 | Paso | Comando | Qué hace |
 |------|---------|----------|
-| guarda | `git log -1 --format=%B RAMA` + `git diff --name-only development...RAMA` | Guarda el mensaje del último commit y la lista de archivos que tocaste. |
+| guarda | (registro de archivos por commit) + `git log -1 --format=%B RAMA` | Ya tiene la lista exacta de archivos commiteados y el mensaje del último commit. |
 | a | `git rebase --abort` | Sale del conflicto (rama intacta). |
 | b | `git branch -m RAMA RAMA-bk` | Renombra la rama a **backup** (si ya existe `-bk`, usa `-bk2`, etc.). |
 | c | `git checkout -b RAMA development` | Recrea la rama, nombre correcto, desde development al día. |
@@ -426,6 +422,18 @@ marcada como agresiva y pide confirmación mostrando qué archivos va a traer.
 
 > Esta opción solo aparece cuando hay un conflicto real, así que no se ve en `--demo`
 > (en demo el rebase nunca choca).
+
+### `pull --rebase` con reintentos (pasajes a producción)
+
+Un `pull --rebase` puede fallar por algo transitorio, o porque justo hay un **pasaje
+a producción** bloqueando el remote. En cualquier flujo que sincronice, si falla:
+
+1. **Reintenta solo una vez**, automáticamente, tras una pausa corta.
+2. Si sigue fallando, pregunta: *"¿Se está haciendo un pasaje a producción ahora?"*.
+   - **Sí** → avisa que el remote puede estar bloqueado y te deja elegir entre
+     **esperar ~20s y reintentar** o **frenar** (reintentar a mano cuando termine el pasaje).
+   - **No** → asume que es transitorio: espera unos segundos y reintenta (en loop,
+     volviéndote a preguntar en cada vuelta).
 
 ### Otras validaciones
 
@@ -489,7 +497,7 @@ Referencias:
 | **Pilotado: eliminar** | `checkout development` · `branch -D rama` |
 | **Rehacer rama (conflicto)** | `rebase --abort` · `branch -m rama rama-bk` · `checkout -b rama development` · `checkout rama-bk -- archivos` · `commit` · `push` |
 | **Chequear (3)** | `fetch origin development` · `rev-list --count` · `pull --rebase` |
-| **Arreglar PR (4)** | `checkout development` · `pull --rebase` · `checkout rama` · `rebase development` · `add -A` · `commit` · `push --force-with-lease` |
+| **Arreglar PR (4)** | `checkout development` · `pull --rebase` · `checkout rama` · `rebase development` · `push -f` |
 
 ## Preguntas frecuentes
 

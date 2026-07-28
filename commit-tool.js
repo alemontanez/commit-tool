@@ -46,8 +46,13 @@ const buildCommitMsg = ({ type = 'chore', epic, ticket, description }) => `${typ
 
 // Datos ficticios del modo demo — nombres OBVIAMENTE de ejemplo para que nadie se asuste.
 const DEMO_STATUS = [' M src/demo/archivo-de-ejemplo.ts', '?? src/demo/notas-de-ejemplo.txt'];
-const DEMO_FILE = 'src/demo/archivo-de-ejemplo.ts';
 let demoDirty = true; // en demo simulamos que hay cambios sin commitear hasta que se "commitea"
+
+// Archivos exactos commiteados en el flujo actual (unión de todos los commits de la
+// sesión sobre la rama). Lo usa "rehacer la rama" para traer del backup SOLO esos
+// archivos y no inferirlos con un diff (que puede arrastrar archivos de más). Se
+// resetea al arrancar cada flujo que crea/toca una rama.
+let committedFiles = [];
 
 // ============================ COLORES ============================
 const paint = (n) => (s) => `\x1b[${n}m${s}\x1b[0m`;
@@ -225,6 +230,7 @@ async function buildCommitInteractive(ticket) {
 // ============================ TOOL 1: CREAR PR (flujo completo, de un tiro) ============================
 async function flowCreatePR() {
   console.log(bold('› Crear PR'));
+  committedFiles = [];
 
   // repo
   const info = getRepoInfo();
@@ -341,7 +347,7 @@ async function toolCheckSync() {
   if (behind > 0) {
     console.log('  ' + yellow(`⚠ '${BASE_BRANCH}' está ${behind} commit(s) atrás de ${REMOTE}. Conviene un pull --rebase.`));
     if (await confirm('¿Hago git pull --rebase ahora?', true)) {
-      const r = await step(['pull', '--rebase'], { sim: { note: `${BASE_BRANCH} actualizado` } });
+      const r = await pullRebase();
       if (!SANDBOX && !r.ok) console.log(red('  ✗ Falló: ' + r.stderr));
     }
   } else console.log('  ' + green('✓ ') + `'${BASE_BRANCH}' está al día con ${REMOTE}.`);
@@ -350,7 +356,8 @@ async function toolCheckSync() {
 // ============================ TOOL 4: ARREGLAR PR BUGUEADO (prod) ============================
 async function toolFixProdPR() {
   console.log(bold('› Arreglar PR bugueado tras pasaje a producción'));
-  console.log(dim('  Actualiza development, rebasa la rama del PR, agrega un cambio mínimo y hace push FORZADO.'));
+  console.log(dim('  Actualiza development, rebasa la rama del PR sobre lo último y hace push FORZADO (git push -f).'));
+  committedFiles = [];
   const info = getRepoInfo();
   if (!SANDBOX && !info) { console.log(red('  ✗ No estás en un repo git.')); return; }
 
@@ -366,36 +373,12 @@ async function toolFixProdPR() {
     git(['checkout', '-b', branch, `${REMOTE}/${branch}`]);
   }
 
-  const epic = await pickEpic();
-  const description = await text('Descripción del commit de refresco', {
-    defaultValue: 'refresh PR tras pasaje a produccion', validate: (x) => (x.length < 3 ? 'Muy corta' : null),
-  });
-  const commitMsg = `chore(${epic}): [${branch}] ${description}`;
-
-  // elegir archivo a tocar
-  let fileToTouch = null;
-  if (SANDBOX) fileToTouch = DEMO_FILE;
-  else {
-    const files = git(['diff', '--name-only', `${BASE_BRANCH}...${branch}`]).stdout.split('\n').filter(Boolean);
-    if (files.length) {
-      const opts = files.slice(0, 15).map((f) => ({ label: f, value: f }));
-      opts.push({ label: dim('Escribir otra ruta a mano'), value: '__other__' });
-      const c = await select('¿A qué archivo le agrego el cambio mínimo (salto de línea)?', opts);
-      fileToTouch = c === '__other__' ? await text('Ruta del archivo (relativa a la raíz del repo)') : c;
-    } else {
-      fileToTouch = await text('Ruta del archivo para el cambio mínimo (relativa a la raíz del repo)');
-    }
-  }
-
   console.log('\n' + bold('› Resumen'));
   console.log(dim('  ─────────────────────────────────────────────'));
   console.log('  Branch: ' + cyan(branch) + yellow('  (push FORZADO)'));
-  console.log('  Commit: ' + cyan(commitMsg));
-  console.log('  Cambio mínimo en: ' + cyan(fileToTouch));
   console.log(dim('  ─────────────────────────────────────────────'));
   [`git checkout ${BASE_BRANCH}`, `git pull --rebase`, `git checkout ${branch}`, `git rebase ${BASE_BRANCH}`,
-    `(agrega un salto de línea a ${fileToTouch})`, `git add -A`, `git commit -m "..."`,
-    `git push --force-with-lease ${REMOTE} ${branch}   ${yellow('(FORZADO)')}`,
+    `git push -f ${REMOTE} ${branch}   ${yellow('(FORZADO)')}`,
   ].forEach((p) => console.log('    ' + gray('· ') + p));
   console.log('');
   if (!(await confirm('¿Ejecuto esto?', true))) return;
@@ -403,17 +386,8 @@ async function toolFixProdPR() {
 
   if (!(await syncFromBase(branch)).ok) return;   // bajar base + rebasar (maneja conflictos)
 
-  // cambio mínimo
-  if (SANDBOX) console.log('  ' + green('✓ ') + dim('(simulado) salto de línea agregado'));
-  else {
-    try { fs.appendFileSync(path.join(repoRoot, fileToTouch), '\n'); console.log('  ' + green('✓ ') + dim('salto de línea agregado a ' + fileToTouch)); }
-    catch (e) { return stop('No pude escribir el archivo: ' + e.message); }
-  }
-
-  let r = await step(['add', '-A'], { sim: { note: 'staged' } }); if (bad(r)) return stop('add falló.');
-  if (!(await commit(commitMsg)).ok) return;
-
-  if (!(await pushBranch(branch, { forced: true })).ok) return;   // subir (siempre forzado en este flujo)
+  const r = await step(['push', '-f', REMOTE, branch], { sim: { note: 'pusheado (forzado)' } });
+  if (bad(r)) return stop('Falló el push.');
   console.log('\n' + green(bold('✔ Listo.')));
 }
 
@@ -487,18 +461,64 @@ async function stageChanges() {
   return bad(r) ? { ok: false } : { ok: true };
 }
 
+// Registra en committedFiles los archivos del último commit (HEAD).
+function recordCommittedFiles() {
+  const files = git(['diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD']).stdout
+    .split('\n').map((f) => f.trim().replace(/^"(.*)"$/, '$1')).filter(Boolean);
+  for (const f of files) if (!committedFiles.includes(f)) committedFiles.push(f);
+}
+
 // Crea el commit con el mensaje ya armado. { ok }
 async function commit(commitMsg) {
   const r = await step(['commit', '-m', commitMsg], { sim: { note: 'commit creado' } });
   if (bad(r)) { stop('Falló el commit.'); return { ok: false }; }
+  if (!SANDBOX) recordCommittedFiles();   // guardo los archivos exactos para "rehacer la rama"
   return { ok: true };
+}
+
+// pull --rebase con reintentos. Un `pull --rebase` puede fallar por algo transitorio
+// (o porque justo hay un pasaje a producción bloqueando el remote). Reintenta solo una
+// vez; si sigue fallando, pregunta si hay un pasaje a prod en curso y deja decidir
+// entre esperar y reintentar o frenar. Devuelve el último resultado de git.
+async function pullRebase() {
+  const attempt = () => step(['pull', '--rebase'], { sim: { note: `${BASE_BRANCH} actualizado` } });
+
+  let r = await attempt();
+  if (!bad(r)) return r;
+
+  // reintento automático (1 vez) tras una pausa corta
+  console.log('  ' + yellow('⚠ Falló el pull --rebase.') + dim(' Reintento automático en unos segundos...'));
+  await sleep(4000);
+  r = await attempt();
+  if (!bad(r)) return r;
+
+  // sigue fallando → involucrar al usuario
+  while (bad(r)) {
+    const deploy = await confirm('El pull --rebase sigue fallando. ¿Se está haciendo un pasaje a producción ahora?', false);
+    if (deploy) {
+      console.log('  ' + yellow('⚠ El remote puede estar bloqueado por el pasaje.') + dim(' Conviene esperar a que termine.'));
+      const c = await select('¿Qué hago?', [
+        { label: 'Esperar ~20s y reintentar', value: 'wait' },
+        { label: 'Frenar acá (reintento a mano cuando termine el pasaje)', value: 'stop' },
+      ]);
+      if (c === 'stop') return r;
+      console.log(dim('  Esperando a que termine el pasaje...'));
+      await sleep(20000);
+    } else {
+      console.log('  ' + dim('Parece transitorio. Espero un poco y reintento...'));
+      await sleep(6000);
+    }
+    r = await attempt();
+    if (!bad(r)) return r;
+  }
+  return r;
 }
 
 // "Bajar": actualiza la base y rebasa la rama sobre ella. NUNCA pushea. { ok, conflict }
 async function syncFromBase(branch) {
   let r = await step(['checkout', BASE_BRANCH], { sim: { note: `en '${BASE_BRANCH}'` } });
   if (bad(r)) { stop('No pude ir a ' + BASE_BRANCH + '.'); return { ok: false }; }
-  r = await step(['pull', '--rebase'], { sim: { note: `${BASE_BRANCH} actualizado` } });
+  r = await pullRebase();
   if (bad(r)) { stop('Falló el pull --rebase.'); return { ok: false }; }
   r = await step(['checkout', branch], { sim: { note: `en '${branch}'` } });
   if (bad(r)) { stop('No pude volver a la rama.'); return { ok: false }; }
@@ -557,7 +577,15 @@ async function rebuildBranchFromBackup(branch) {
   if (!ab.ok) { console.log(red('  ✗ No pude abortar el rebase: ' + ab.stderr)); return; }
 
   const commitMsg = git(['log', '-1', '--format=%B', branch]).stdout;           // mensaje del último commit
-  const changed = git(['diff', '--name-only', `${BASE_BRANCH}...${branch}`]).stdout.split('\n').filter(Boolean);
+
+  // Archivos a traer: los EXACTOS que commiteó esta sesión (100% preciso). Si no hay
+  // (ej. arreglar PR, que no commitea nada nuevo), caigo a los archivos de los commits
+  // propios de la rama (git log dos-puntos), que es más preciso que el diff three-dot.
+  let changed = committedFiles.slice();
+  if (!changed.length) {
+    changed = [...new Set(git(['log', '--name-only', '--pretty=format:', `${BASE_BRANCH}..${branch}`]).stdout
+      .split('\n').map((f) => f.trim().replace(/^"(.*)"$/, '$1')).filter(Boolean))];
+  }
   if (!changed.length) { console.log(yellow('  No detecté archivos cambiados en la rama; mejor resolvé a mano.')); return; }
 
   // elegir qué archivos traer
@@ -644,6 +672,7 @@ async function handleRebaseConflict(branch) {
 // en git, así que cada vuelta releemos la rama real.
 async function pilotedMode() {
   console.log(bold('› Modo pilotado'));
+  committedFiles = [];
   const info = getRepoInfo();
   if (!SANDBOX && !info) { console.log(red('  ✗ No estás en un repo git.')); return; }
 
@@ -666,13 +695,13 @@ async function pilotedMode() {
     console.log(dim('  ─────────────────────────'));
 
     const c = await select('Acción:', [
-      { label: '⬢  Entrar / crear rama de tarea', value: 'branch' },
-      { label: '💾 Commitear (stagea + commit; repetible)', value: 'commit' },
-      { label: '⬇️  Bajar cambios — sync ' + BASE_BRANCH + ' (sin push)', value: 'down' },
-      { label: '⬆️  Subir — push', value: 'up' },
-      { label: '🗑  Eliminar rama local', value: 'delete' },
-      { label: '📊 Estado detallado', value: 'status' },
-      { label: '↩️  Volver al menú', value: 'back' },
+      { label: '· Entrar / crear rama de tarea', value: 'branch' },
+      { label: '· Commitear (stagea + commit; repetible)', value: 'commit' },
+      { label: '· Bajar cambios — sync ' + BASE_BRANCH + ' (sin push)', value: 'down' },
+      { label: '· Subir — push', value: 'up' },
+      { label: '· Eliminar rama local', value: 'delete' },
+      { label: '· Estado detallado', value: 'status' },
+      { label: '· Volver al menú', value: 'back' },
     ]);
     if (c === 'back') return;
     try {
@@ -710,7 +739,7 @@ async function pilotEnterBranch() {
       } else if (await confirm(`¿Actualizo '${BASE_BRANCH}' antes de crear la rama? (evita el problema del rebase)`, true)) {
         const cur = git(['rev-parse', '--abbrev-ref', 'HEAD']).stdout;
         if (cur !== BASE_BRANCH) { const co = git(['checkout', BASE_BRANCH]); if (!co.ok) { console.log(red('  ✗ ' + co.stderr)); return; } }
-        const pr = await step(['pull', '--rebase'], { sim: { note: `${BASE_BRANCH} actualizado` } });
+        const pr = await pullRebase();
         if (bad(pr)) return stop(`No pude actualizar '${BASE_BRANCH}'.`);
       }
     }
@@ -737,7 +766,7 @@ async function pilotDown(branch, onBase) {
     return;
   }
   if (onBase) {
-    const r = await step(['pull', '--rebase'], { sim: { note: `${BASE_BRANCH} actualizado` } });
+    const r = await pullRebase();
     if (bad(r)) return stop('Falló el pull --rebase.');
     console.log('  ' + green('✓ ') + dim(`'${BASE_BRANCH}' al día.`));
     return;
@@ -816,12 +845,12 @@ async function mainMenu() {
   while (true) {
     console.log('');
     const choice = await select('¿Qué querés hacer?', [
-      { label: '1. Crear PR (flujo completo, un solo commit)', value: 'create' },
-      { label: '2. Modo pilotado (commits de a poco, subir/bajar manual)', value: 'piloted' },
-      { label: '3. Chequear rama / sincronizar ' + BASE_BRANCH, value: 'check' },
-      { label: '4. Arreglar PR bugueado tras pasaje a producción', value: 'fixprod' },
-      { label: '5. Administrar EPICs y TEAMs', value: 'config' },
-      { label: '6. Salir', value: 'exit' },
+      { label: '· Crear PR (flujo completo, un solo commit)', value: 'create' },
+      { label: '· Modo pilotado (commits de a poco, subir/bajar manual)', value: 'piloted' },
+      { label: '· Chequear rama / sincronizar ' + BASE_BRANCH, value: 'check' },
+      { label: '· Arreglar PR bugueado tras pasaje a producción', value: 'fixprod' },
+      { label: '· Administrar EPICs y TEAMs', value: 'config' },
+      { label: '· Salir', value: 'exit' },
     ]);
     if (choice === 'exit') { return; }
     try {
