@@ -397,11 +397,17 @@ rebase choca con un montón de conflictos". En vez de mergear a mano, **rehace l
 desde el development actualizado y trae tus versiones** de los archivos que elijas.
 No borra nada hasta que el push salió bien.
 
-La lista de archivos a traer son los **exactos que commiteaste en esta sesión**
-(la herramienta los registra en cada commit, con `git diff-tree --name-only HEAD`),
-no un diff que podría arrastrar archivos de más. Si no hubo commit de la sesión
-(ej. arreglar PR), cae a los archivos de los commits propios de la rama
-(`git log --name-only development..RAMA`).
+La lista de archivos a traer se resuelve por orden de precisión, para no arrastrar
+archivos de más:
+
+1. Los **exactos que commiteaste en esta sesión** (la herramienta los registra en
+   cada commit con `git diff-tree --name-only HEAD`).
+2. Si no hay (ej. arreglar un PR que se bugueó, que no commitea nada en la sesión),
+   consulta el **historial de los últimos 3 commits** guardado en la config y te
+   muestra, del más reciente al más viejo, qué archivos tocó cada uno para que
+   confirmes cuál es el PR a arreglar.
+3. Como último recurso, los archivos de los commits propios de la rama
+   (`git log --name-only development..RAMA`).
 
 | Paso | Comando | Qué hace |
 |------|---------|----------|
@@ -452,7 +458,9 @@ No toca git. Administra los datos que la herramienta recuerda para no recargarlo
 - Agregar / eliminar **EPICs**.
 
 Se guardan en `~/.commit-tool.json` (fuera del repo). El último TEAM, EPIC y rama
-usados se recuerdan y aparecen como opción por defecto la próxima vez.
+usados se recuerdan y aparecen como opción por defecto la próxima vez. Ahí también
+se guarda un **historial de los últimos 3 commits** (rama + archivos + mensaje) que
+usa el "rehacer la rama" para recuperar los archivos exactos entre sesiones.
 
 ## Tipos de commit (Conventional Commits)
 

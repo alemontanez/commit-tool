@@ -64,10 +64,10 @@ function loadConfig() {
   for (const p of [CONFIG_PATH, OLD_CONFIG_PATH]) {
     try {
       const c = JSON.parse(fs.readFileSync(p, 'utf8'));
-      return { teams: c.teams || [], epics: c.epics || [], lastTeam: c.lastTeam || null, lastEpic: c.lastEpic || null, lastBranch: c.lastBranch || null };
+      return { teams: c.teams || [], epics: c.epics || [], lastTeam: c.lastTeam || null, lastEpic: c.lastEpic || null, lastBranch: c.lastBranch || null, commitHistory: c.commitHistory || [] };
     } catch { /* sigue con el próximo path */ }
   }
-  return { teams: [], epics: [], lastTeam: null, lastEpic: null, lastBranch: null };
+  return { teams: [], epics: [], lastTeam: null, lastEpic: null, lastBranch: null, commitHistory: [] };
 }
 function saveConfig() {
   try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), 'utf8'); }
@@ -109,7 +109,7 @@ function select(message, options) {
       if (key.name === 'up') { sel = (sel - 1 + options.length) % options.length; render(false); }
       else if (key.name === 'down') { sel = (sel + 1) % options.length; render(false); }
       else if (key.name === 'return') { cleanup(); process.stdout.write(dim('  → ') + options[sel].label + '\n\n'); resolve(options[sel].value); }
-      else if (key.ctrl && key.name === 'c') { cleanup(); console.log('\n' + yellow('Chau.')); process.exit(0); }
+      else if (key.ctrl && key.name === 'c') { cleanup(); console.log('\n' + yellow('Saliendo.')); process.exit(0); }
     };
     process.stdin.on('keypress', onKey);
   });
@@ -461,11 +461,21 @@ async function stageChanges() {
   return bad(r) ? { ok: false } : { ok: true };
 }
 
-// Registra en committedFiles los archivos del último commit (HEAD).
+// Registra los archivos del último commit (HEAD): en memoria para el flujo actual,
+// y en un historial persistido (últimos 3) para poder recuperarlos en otra sesión
+// (ej. arreglar un PR que se bugueó, donde no hay commit de esta sesión).
 function recordCommittedFiles() {
   const files = git(['diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD']).stdout
     .split('\n').map((f) => f.trim().replace(/^"(.*)"$/, '$1')).filter(Boolean);
+  if (!files.length) return;
   for (const f of files) if (!committedFiles.includes(f)) committedFiles.push(f);
+
+  const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']).stdout;
+  const message = git(['log', '-1', '--format=%s', 'HEAD']).stdout;
+  cfg.commitHistory = cfg.commitHistory || [];
+  cfg.commitHistory.unshift({ branch, files, message, ts: new Date().toISOString() });
+  cfg.commitHistory = cfg.commitHistory.slice(0, 3);   // solo los últimos 3
+  saveConfig();
 }
 
 // Crea el commit con el mensaje ya armado. { ok }
@@ -499,7 +509,7 @@ async function pullRebase() {
       console.log('  ' + yellow('⚠ El remote puede estar bloqueado por el pasaje.') + dim(' Conviene esperar a que termine.'));
       const c = await select('¿Qué hago?', [
         { label: 'Esperar ~20s y reintentar', value: 'wait' },
-        { label: 'Frenar acá (reintento a mano cuando termine el pasaje)', value: 'stop' },
+        { label: 'Frenar (reintento manual cuando termine el pasaje)', value: 'stop' },
       ]);
       if (c === 'stop') return r;
       console.log(dim('  Esperando a que termine el pasaje...'));
@@ -532,7 +542,7 @@ async function pushBranch(branch, { forced = false } = {}) {
   if (forced && isLive()) {
     console.log('\n  ' + yellow('⚠ La rama fue reescrita; el push tiene que ser FORZADO.'));
     if (!(await confirm(`¿Hacer push --force-with-lease sobre ${branch}?`, false))) {
-      console.log(dim('  No pusheé. La rama local quedó lista; podés pushear a mano cuando quieras.'));
+      console.log(dim('  No se hizo push. La rama local quedó lista; podés pushear manualmente cuando quieras.'));
       return { ok: false, skipped: true };
     }
   }
@@ -563,14 +573,32 @@ function pickBackupName(branch) {
   return name;
 }
 
+// Consulta el historial de últimos commits (persistido en la config) para recuperar
+// los archivos EXACTOS cuando no los tenemos en memoria (ej. arreglar un PR bugueado,
+// donde no se commitea nada en la sesión). Muestra del más reciente al más viejo con
+// sus archivos y pregunta cuál es el PR a arreglar. Devuelve los archivos o null.
+async function pickFilesFromHistory(branch) {
+  const hist = cfg.commitHistory || [];
+  if (!hist.length) return null;
+  console.log('  ' + yellow('No tengo los archivos de esta sesión.') + dim(' Reviso el historial de los últimos commits...'));
+  for (const e of hist) {
+    console.log('');
+    console.log('  ' + dim('rama: ') + cyan(e.branch) + (e.branch === branch ? dim('  (la que estás arreglando)') : '') + (e.message ? dim('   · ' + e.message) : ''));
+    (e.files || []).forEach((f) => console.log('    ' + dim('· ') + f));
+    if (await confirm('¿Son estos los archivos del PR a arreglar?', e.branch === branch)) return (e.files || []).slice();
+  }
+  console.log(dim('  Ninguno del historial coincide.'));
+  return null;
+}
+
 // OPCIÓN AGRESIVA de resolución: en vez de mergear el conflicto, rehace la rama
 // desde development actualizado y trae TUS versiones de los archivos elegidos.
 // Descarta lo que otros cambiaron EN ESOS archivos (queda como revisión de código;
 // sus cambios siguen sanos en development). Nada se borra hasta que el push salió bien.
 async function rebuildBranchFromBackup(branch) {
-  console.log('\n  ' + yellow('⚠ Rehacer la rama (modo agresivo).'));
-  console.log(dim(`  Trae TUS versiones de los archivos que elijas y descarta lo que otros cambiaron en ESOS archivos.`));
-  console.log(dim(`  (los cambios ajenos siguen intactos en '${BASE_BRANCH}'; esto es un tema de revisión de código, no de pérdida de datos). Al final PUSHEA.`));
+  console.log('\n  ' + yellow('⚠ Rehacer la rama (opción agresiva).'));
+  console.log(dim(`  Trae tus versiones de los archivos que elijas y descarta lo que otros cambiaron en esos archivos.`));
+  console.log(dim(`  (los cambios ajenos siguen intactos en '${BASE_BRANCH}'; es un tema de revisión de código, no de pérdida de datos). Al final hace el push.`));
 
   // salgo del conflicto; la rama vuelve como estaba (tu commit intacto)
   const ab = git(['rebase', '--abort']);
@@ -578,15 +606,20 @@ async function rebuildBranchFromBackup(branch) {
 
   const commitMsg = git(['log', '-1', '--format=%B', branch]).stdout;           // mensaje del último commit
 
-  // Archivos a traer: los EXACTOS que commiteó esta sesión (100% preciso). Si no hay
-  // (ej. arreglar PR, que no commitea nada nuevo), caigo a los archivos de los commits
-  // propios de la rama (git log dos-puntos), que es más preciso que el diff three-dot.
+  // Archivos a traer, por orden de precisión:
+  //  1) los EXACTOS que commiteó ESTA sesión (100% preciso).
+  //  2) el historial persistido de últimos commits (ej. arreglar PR: no hay commit de la sesión).
+  //  3) último recurso: los archivos de los commits propios de la rama (git log dos-puntos).
   let changed = committedFiles.slice();
+  if (!changed.length) {
+    const fromHist = await pickFilesFromHistory(branch);
+    if (fromHist && fromHist.length) changed = fromHist;
+  }
   if (!changed.length) {
     changed = [...new Set(git(['log', '--name-only', '--pretty=format:', `${BASE_BRANCH}..${branch}`]).stdout
       .split('\n').map((f) => f.trim().replace(/^"(.*)"$/, '$1')).filter(Boolean))];
   }
-  if (!changed.length) { console.log(yellow('  No detecté archivos cambiados en la rama; mejor resolvé a mano.')); return; }
+  if (!changed.length) { console.log(yellow('  No detecté archivos cambiados en la rama; conviene resolverlo manualmente.')); return; }
 
   // elegir qué archivos traer
   console.log(dim('\n  Archivos que tocaste en la rama:'));
@@ -647,22 +680,22 @@ async function handleRebaseConflict(branch) {
   const conflicted = git(['diff', '--name-only', '--diff-filter=U']).stdout;
   console.log('\n  ' + yellow('⚠ El rebase encontró conflictos.'));
   if (conflicted) { console.log(dim('  Archivos en conflicto:')); conflicted.split('\n').forEach((f) => console.log('    ' + red('· ') + f)); }
-  console.log(dim('  Tranqui: tus commits NO se pierden. Si abortás, la rama vuelve exactamente como estaba.'));
+  console.log(dim('  Tus commits no se pierden: si abortás, la rama vuelve al estado anterior.'));
   const c = await select('¿Cómo seguimos? (NO se va a hacer push, salvo la opción de rehacer)', [
     { label: 'Abortar el rebase y volver todo atrás (git rebase --abort)', value: 'abort' },
-    { label: 'Salir y resolver a mano en la terminal', value: 'manual' },
+    { label: 'Salir y resolver manualmente en la terminal', value: 'manual' },
     { label: yellow('Rehacer la rama desde ' + BASE_BRANCH + ' con mis archivos (agresivo, con backup)'), value: 'rebuild' },
   ]);
   if (c === 'abort') {
     const a = git(['rebase', '--abort']);
     console.log(a.ok ? green('  ✓ Rebase abortado.') : red('  ✗ ' + a.stderr));
-    console.log(yellow('  Frené antes del push.'));
+    console.log(yellow('  Se frenó antes del push.'));
   } else if (c === 'rebuild') {
     await rebuildBranchFromBackup(branch);
   } else {
     console.log(dim('  Rebase en curso. Para continuar:'));
     console.log(dim('    1) resolvé los conflictos  2) git add <archivos> && git rebase --continue  3) git push ' + REMOTE + ' ' + branch));
-    console.log(yellow('  Frené antes del push.'));
+    console.log(yellow('  Se frenó antes del push.'));
   }
 }
 
@@ -733,9 +766,9 @@ async function pilotEnterBranch() {
     git(['fetch', REMOTE, BASE_BRANCH]);
     const behind = parseInt(git(['rev-list', '--count', `${BASE_BRANCH}..${REMOTE}/${BASE_BRANCH}`]).stdout || '0', 10);
     if (behind > 0) {
-      console.log('  ' + yellow(`⚠ Tu '${BASE_BRANCH}' local está ${behind} commit(s) atrás de ${REMOTE}.`) + dim(' Branchear desde acá suele traer conflictos de rebase después.'));
+      console.log('  ' + yellow(`⚠ Tu '${BASE_BRANCH}' local está ${behind} commit(s) atrás de ${REMOTE}.`) + dim(' Branchear desde este punto suele traer conflictos de rebase después.'));
       if (dirtyCount() > 0) {
-        console.log('  ' + dim(`Tenés cambios sin commitear, así que no puedo actualizar '${BASE_BRANCH}' ahora. Creo la rama desde tu '${BASE_BRANCH}' local igual (ojo con el rebase después).`));
+        console.log('  ' + dim(`Tenés cambios sin commitear, así que no puedo actualizar '${BASE_BRANCH}' ahora. Creo la rama desde tu '${BASE_BRANCH}' local igual (tené en cuenta el rebase posterior).`));
       } else if (await confirm(`¿Actualizo '${BASE_BRANCH}' antes de crear la rama? (evita el problema del rebase)`, true)) {
         const cur = git(['rev-parse', '--abbrev-ref', 'HEAD']).stdout;
         if (cur !== BASE_BRANCH) { const co = git(['checkout', BASE_BRANCH]); if (!co.ok) { console.log(red('  ✗ ' + co.stderr)); return; } }
@@ -751,7 +784,7 @@ async function pilotEnterBranch() {
 }
 
 async function pilotCommit(branch, onBase) {
-  if (onBase && !(await confirm(yellow(`Estás en '${BASE_BRANCH}'. ¿Seguro querés commitear acá?`), false))) return;
+  if (onBase && !(await confirm(yellow(`Estás en '${BASE_BRANCH}'. ¿Seguro querés commitear en esta rama?`), false))) return;
   const staged = await stageChanges();   // muestra el git add (real y demo)
   if (!staged.ok) return;
   const commitMsg = await buildCommitInteractive(branch);
@@ -775,7 +808,7 @@ async function pilotDown(branch, onBase) {
 }
 
 async function pilotUp(branch, onBase) {
-  if (onBase) { console.log(yellow(`  '${BASE_BRANCH}' no se pushea desde acá.`)); return; }
+  if (onBase) { console.log(yellow(`  '${BASE_BRANCH}' no se pushea desde esta opción.`)); return; }
   // Antes de pushear: asegurar que la rama esté sobre el último development del remote.
   if (!SANDBOX) {
     git(['fetch', REMOTE, BASE_BRANCH]);
